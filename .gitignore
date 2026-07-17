@@ -1,0 +1,21 @@
+# PyInstaller 构建产物（体积大，不入库）
+/dist/
+/build/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器 / 工具的本机配置（含本地路径，不入库）
+.vscode/
+.idea/
+.claude/settings.local.json
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 运行时产生
+*.log
