@@ -2,6 +2,13 @@
 
 Windows 桌面工具，用于**批量打印 PDF 和图片**。可调用打印机原生设置并应用到全部文档，也支持对单个文档单独设置。
 
+![界面截图](docs/screenshot.png)
+
+## 下载
+
+免安装绿色版见 [Releases](https://github.com/kostya-sheng/batch-print/releases)：下载 zip 解压后，
+双击 `批量打印.exe` 即可运行，无需安装 Python。
+
 详见开发蓝图：[批量打印应用_开发蓝图.md](批量打印应用_开发蓝图.md)
 
 ## 功能
