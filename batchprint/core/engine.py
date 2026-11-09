@@ -187,11 +187,14 @@ def _mutable_devmode(settings: EffectiveSettings):
 
 
 def print_job(settings: EffectiveSettings, path: Path, kind: str,
-              cancel: CancelCheck = None, output_file: str | None = None) -> None:
+              cancel: CancelCheck = None, output_file: str | None = None,
+              doc_name: str | None = None) -> None:
     """用生效设置打印单个文件；抛异常表示失败，PrintCancelled 表示被中止。
 
     output_file: 若指定，则把输出重定向到该文件（用于"打印到文件"驱动或测试），
                  而不是正常送打印机。通常留空。
+    doc_name:    打印队列里显示的文档名。Word 文档实际打印的是缓存里的 PDF，
+                 用这个参数显示原文件名，而不是缓存文件名。
     """
     if not path.exists():
         raise FileNotFoundError(f"文件不存在: {path}")
@@ -213,20 +216,21 @@ def print_job(settings: EffectiveSettings, path: Path, kind: str,
             work_devmode = None
     auto = work_devmode is not None
 
-    log.info("打印 %s（%s，%d 份，自动方向=%s）到 %s", path.name, kind, copies,
-             auto, settings.printer_name)
+    log.info("打印 %s（%s，%d 份，自动方向=%s）到 %s", doc_name or path.name, kind,
+             copies, auto, settings.printer_name)
 
     dc = _create_printer_dc(settings.printer_name, dc_devmode)
     try:
         render_dpi = min(dc.GetDeviceCaps(win32con.LOGPIXELSX) or 300, MAX_RENDER_DPI)
         current_orient = orientations[0] if auto else None
 
+        title = doc_name or str(path)
         for _copy in range(copies):
             _check_cancel(cancel)
             if output_file:
-                dc.StartDoc(str(path), output_file)
+                dc.StartDoc(title, output_file)
             else:
-                dc.StartDoc(str(path))
+                dc.StartDoc(title)
             try:
                 for page_no, img in enumerate(
                     _iter_job_images(path, kind, settings, render_dpi)

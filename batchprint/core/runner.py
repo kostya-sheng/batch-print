@@ -2,10 +2,18 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
+from typing import Optional
 
 from PySide6.QtCore import QThread, Signal
 
 from . import engine
+from .converter import (
+    NO_CONVERTER_MSG,
+    ConversionCancelled,
+    ConversionError,
+    WordConverter,
+)
 from .settings import (
     STATUS_DONE,
     STATUS_FAILED,
@@ -33,10 +41,12 @@ class JobRunner(QThread):
     finished_all = Signal(int, int)
 
     def __init__(self, global_settings: GlobalSettings,
-                 jobs: list[tuple[int, PrintJob]], parent=None):
+                 jobs: list[tuple[int, PrintJob]],
+                 converter: Optional[WordConverter] = None, parent=None):
         super().__init__(parent)
         self._global = global_settings
         self._jobs = jobs               # [(原始行号, job), ...]
+        self._converter = converter     # Word 文档转 PDF 用
         self._stop = False
 
     def stop(self) -> None:
@@ -55,7 +65,10 @@ class JobRunner(QThread):
             self.job_started.emit(index)
             try:
                 eff = resolve(self._global, job)
-                engine.print_job(eff, job.path, job.kind, cancel=self._cancelled)
+                if job.kind == "word":
+                    self._print_word(job, eff)
+                else:
+                    engine.print_job(eff, job.path, job.kind, cancel=self._cancelled)
                 job.status = STATUS_DONE
                 job.error = None
                 self.job_finished.emit(index, True, "")
@@ -66,10 +79,28 @@ class JobRunner(QThread):
                 failed += 1
                 job.status = STATUS_FAILED
                 job.error = str(exc)
-                log.exception("打印失败: %s", job.path)
+                if isinstance(exc, ConversionError):   # 文档本身的问题，原因已说清，不需要堆栈
+                    log.warning("打印失败: %s: %s", job.path, exc)
+                else:
+                    log.exception("打印失败: %s", job.path)
                 self.job_finished.emit(index, False, str(exc))
             finally:
                 done += 1
                 self.progress.emit(done, total)
 
         self.finished_all.emit(done, failed)
+
+    def _print_word(self, job: PrintJob, eff) -> None:
+        """Word 文档：先拿到转换好的 PDF（没转完就插队转换并等待），再按 PDF 打印。
+
+        之前转换失败的也会在这里重试一次——比如上次只是 Word 临时卡住。
+        """
+        if self._converter is None or not self._converter.available:
+            raise RuntimeError(NO_CONVERTER_MSG)
+        try:
+            pdf, _pages = self._converter.convert_blocking(
+                str(job.path), job.path, eff.print_markup, self._cancelled)
+        except ConversionCancelled:
+            raise engine.PrintCancelled() from None
+        engine.print_job(eff, Path(pdf), "pdf", cancel=self._cancelled,
+                         doc_name=job.path.name)

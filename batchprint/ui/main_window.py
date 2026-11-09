@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt, QTimer
-from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -29,16 +29,21 @@ from PySide6.QtWidgets import (
 import os
 
 from ..core import importer, printers
+from ..core.converter import NO_CONVERTER_MSG, WordConverter
 from ..core.runner import JobRunner
 from ..core.scanner import ScanWorker
 from ..core.settings import (
     FIT_CENTER,
     FIT_FILL,
     FIT_STRETCH,
+    STATUS_CONVERT_FAILED,
+    STATUS_CONVERTING,
+    STATUS_FAILED,
     STATUS_PENDING,
     STATUS_PRINTING,
     GlobalSettings,
     PrintJob,
+    effective_markup,
     type_label,
 )
 from ..core.thumbnailer import Thumbnailer
@@ -61,6 +66,9 @@ THUMB_PX = 64
 ROW_HEIGHT = THUMB_PX + 8
 INSERT_CHUNK = 20        # 每批插入的行数，批间让出事件循环保持界面响应
 THUMB_PREFETCH = 5       # 可见范围上下额外预取的行数，滚动时更跟手
+
+FAILED_STATUSES = (STATUS_FAILED, STATUS_CONVERT_FAILED)
+FAILED_COLOR = QColor("#DC2626")    # 失败状态用红字
 
 FIT_LABELS = [
     ("等比缩放居中", FIT_CENTER),
@@ -142,6 +150,14 @@ class MainWindow(QMainWindow):
         self.thumbnailer = Thumbnailer(max_px=THUMB_PX)
         self.thumbnailer.ready.connect(self._on_thumb_ready)
 
+        # Word 文档转 PDF：唯一的后台转换线程，不会出现 Word 窗口
+        self.converter = WordConverter(self)
+        self.converter.converted.connect(self._on_word_converted)
+        self.converter.failed.connect(self._on_word_failed)
+        self.converter.start()
+        self._conv_waiting: set[str] = set()   # 已排队、还没出结果的后台转换
+        self._conv_total = 0
+
         self._build_ui()
         self._load_printers()
         self._update_count_label()
@@ -218,7 +234,7 @@ class MainWindow(QMainWindow):
         self.chk_auto_orient = QCheckBox("自动匹配文档方向")
         self.chk_auto_orient.setChecked(self.global_settings.auto_orient)
         self.chk_auto_orient.setToolTip(
-            "勾选后：横向的页面/图片自动用横向打印，纵向的用纵向（PDF 逐页判断）。"
+            "勾选后：横向的页面/图片自动用横向打印，纵向的用纵向（PDF、Word 逐页判断）。"
         )
         self.chk_auto_orient.toggled.connect(self._on_auto_orient_changed)
         set_row.addWidget(self.chk_auto_orient)
@@ -417,6 +433,8 @@ class MainWindow(QMainWindow):
             w.setEnabled(not busy)
 
     def _append_job_row(self, job: PrintJob) -> None:
+        if job.kind == "word":
+            self._queue_conversion(job)
         self.jobs.append(job)
         row = self.table.rowCount()
         self.table.insertRow(row)
@@ -438,10 +456,11 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, COL_NAME, name)
 
         self.table.setItem(row, COL_TYPE, QTableWidgetItem(type_label(job)))
-        self.table.setItem(
-            row, COL_PAGES,
-            QTableWidgetItem("-" if job.pages is None else str(job.pages)),
-        )
+        if job.pages is not None:
+            pages_text = str(job.pages)
+        else:   # Word 文档转换完成前还不知道页数
+            pages_text = "…" if job.status == STATUS_CONVERTING else "-"
+        self.table.setItem(row, COL_PAGES, QTableWidgetItem(pages_text))
         spin = QSpinBox()
         spin.setRange(1, 999)
         spin.setValue(self._effective_copies(job))
@@ -452,7 +471,8 @@ class MainWindow(QMainWindow):
         self._style_copies_spin(spin, job)
         self.table.setCellWidget(row, COL_COPIES, spin)
 
-        self.table.setItem(row, COL_STATUS, QTableWidgetItem(job.status))
+        self.table.setItem(row, COL_STATUS, QTableWidgetItem())
+        self._set_status(row, job.status, job.convert_error or "")
 
         btn = QPushButton("属性")
         btn.clicked.connect(lambda _=False, j=job: self._open_properties(j))
@@ -460,9 +480,74 @@ class MainWindow(QMainWindow):
 
         self.table.blockSignals(False)
 
-        # 异步生成缩略图
-    # 缩略图按需生成：只做屏幕上看得见的那些行
+    def _set_status(self, row: int, text: str, tooltip: str | None = None) -> None:
+        """更新状态列。失败类状态用红字；tooltip 为 None 表示保留原提示。"""
+        item = self.table.item(row, COL_STATUS)
+        if item is None:
+            return
+        item.setText(text)
+        if tooltip is not None:
+            item.setToolTip(tooltip)
+        if text in FAILED_STATUSES:
+            item.setForeground(FAILED_COLOR)
+        else:
+            item.setData(Qt.ForegroundRole, None)      # 恢复默认颜色
 
+    def _set_row_checked(self, row: int, checked: bool) -> None:
+        self.jobs[row].checked = checked
+        self.table.blockSignals(True)
+        self.table.item(row, COL_CHECK).setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        self.table.blockSignals(False)
+
+    # ---------------- Word 文档转换 ----------------
+    def _queue_conversion(self, job: PrintJob) -> None:
+        """导入后立即在后台排队转成 PDF；转完补上页数和缩略图。"""
+        if not self.converter.available:
+            job.status = STATUS_CONVERT_FAILED
+            job.convert_error = NO_CONVERTER_MSG
+            job.checked = False              # 打不出来，默认不勾选
+            return
+        job.status = STATUS_CONVERTING
+        key = str(job.path)
+        self._conv_waiting.add(key)
+        self._conv_total += 1
+        self.converter.request(key, job.path, effective_markup(self.global_settings, job))
+
+    def _on_word_converted(self, key: str, pdf: str, pages: int, markup: bool) -> None:
+        self._conv_waiting.discard(key)
+        row = self._row_of_key(key)
+        if row >= 0:
+            job = self.jobs[row]
+            # 带修订 / 不带修订是两个不同的 PDF，只采用和当前设置一致的那个
+            if markup == effective_markup(self.global_settings, job):
+                job.pdf_path = Path(pdf)
+                job.pages = pages
+                job.convert_error = None
+                self.table.item(row, COL_PAGES).setText(str(pages))
+                if job.status in (STATUS_CONVERTING, STATUS_CONVERT_FAILED):
+                    job.status = STATUS_PENDING
+                    self._set_status(row, STATUS_PENDING, "")
+                self._update_count_label()
+                self._request_visible_thumbs()
+        self._update_thumb_status()
+
+    def _on_word_failed(self, key: str, msg: str) -> None:
+        was_waiting = key in self._conv_waiting
+        self._conv_waiting.discard(key)
+        row = self._row_of_key(key)
+        # 打印时的转换失败由打印线程自己标记，这里只处理导入后的后台转换
+        if was_waiting and row >= 0:
+            job = self.jobs[row]
+            job.convert_error = msg
+            if job.status == STATUS_CONVERTING:
+                job.status = STATUS_CONVERT_FAILED
+                self._set_row_checked(row, False)   # 打不出来，自动取消勾选
+                self._update_count_label()
+            self.table.item(row, COL_PAGES).setText("-")
+            self._set_status(row, job.status, msg)
+        self._update_thumb_status()
+
+    # ---------------- 缩略图：只做屏幕上看得见的那些行 ----------------
     def _request_visible_thumbs(self) -> None:
         """只为可见（及上下预取几行）的行生成缩略图。
 
@@ -484,10 +569,16 @@ class MainWindow(QMainWindow):
             key = str(job.path)
             if key in self._thumb_requested:
                 continue
+            if job.kind == "word":
+                if job.pdf_path is None:
+                    continue        # 还没转好；转换完成后会再次触发这里
+                src, kind = job.pdf_path, "pdf"
+            else:
+                src, kind = job.path, job.kind
             self._thumb_requested.add(key)
             self._thumb_total += 1
             self._thumb_pending += 1
-            self.thumbnailer.request(key, job.path, job.kind)
+            self.thumbnailer.request(key, src, kind)
 
     def _row_of_key(self, key: str) -> int:
         for i, job in enumerate(self.jobs):
@@ -506,17 +597,23 @@ class MainWindow(QMainWindow):
         self._update_thumb_status()
 
     def _update_thumb_status(self) -> None:
-        """缩略图是异步陆续出来的，这里给个进度，别让用户以为卡住了。"""
+        """Word 转换、缩略图都是异步陆续完成的，这里给个进度，别让用户以为卡住了。"""
         if self.scanner and self.scanner.isRunning():
             return                      # 扫描阶段的提示优先
         if self._pending_jobs:
             return                      # 还在插入行
-        if self._thumb_pending > 0:
+        if self.runner and self.runner.isRunning():
+            return                      # 打印中，状态栏显示打印进度
+        if self._conv_waiting:
+            done = self._conv_total - len(self._conv_waiting)
+            self.lbl_status.setText(f"正在转换 Word 文档… {done}/{self._conv_total}")
+        elif self._thumb_pending > 0:
             done = self._thumb_total - self._thumb_pending
             self.lbl_status.setText(f"正在生成预览… {done}/{self._thumb_total}")
-        elif self._thumb_total:
+        elif self._thumb_total or self._conv_total:
             self.lbl_status.setText(f"就绪，共 {len(self.jobs)} 个文件。")
             self._thumb_total = 0
+            self._conv_total = 0
 
     def _open_properties(self, job: PrintJob) -> None:
         dlg = PropertiesDialog(job, self.global_settings, self)
@@ -565,6 +662,7 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("请先选中要移除的行。")
             return
         for row in rows:
+            self._conv_waiting.discard(str(self.jobs[row].path))
             self.table.removeRow(row)
             del self.jobs[row]
         self._rebind_property_buttons()
@@ -578,6 +676,9 @@ class MainWindow(QMainWindow):
         self._thumb_total = 0
         self._thumb_pending = 0
         self._thumb_requested.clear()
+        self.converter.cancel_pending()
+        self._conv_waiting.clear()
+        self._conv_total = 0
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
         self._update_count_label()
@@ -652,14 +753,14 @@ class MainWindow(QMainWindow):
         for row, job in selected:
             job.status = STATUS_PENDING
             job.error = None
-            self.table.item(row, COL_STATUS).setText(STATUS_PENDING)
+            self._set_status(row, STATUS_PENDING, "")
         self.table.blockSignals(False)
 
         self.progress.setRange(0, len(selected))
         self.progress.setValue(0)
         self._set_controls_enabled(False)
 
-        self.runner = JobRunner(self.global_settings, selected, self)
+        self.runner = JobRunner(self.global_settings, selected, self.converter, self)
         self.runner.job_started.connect(self._on_job_started)
         self.runner.job_finished.connect(self._on_job_finished)
         self.runner.progress.connect(self._on_progress)
@@ -676,16 +777,12 @@ class MainWindow(QMainWindow):
     def _on_job_started(self, row: int) -> None:
         if 0 <= row < self.table.rowCount():
             self.jobs[row].status = STATUS_PRINTING
-            self.table.item(row, COL_STATUS).setText(STATUS_PRINTING)
+            self._set_status(row, STATUS_PRINTING)
             self.lbl_status.setText(f"正在打印：{self.jobs[row].path.name}")
 
     def _on_job_finished(self, row: int, ok: bool, msg: str) -> None:
         if 0 <= row < self.table.rowCount():
-            job = self.jobs[row]
-            item = self.table.item(row, COL_STATUS)
-            item.setText(job.status)
-            if not ok:
-                item.setToolTip(msg)
+            self._set_status(row, self.jobs[row].status, "" if ok else msg)
 
     def _on_progress(self, done: int, total: int) -> None:
         self.progress.setValue(done)
@@ -713,6 +810,7 @@ class MainWindow(QMainWindow):
         if self.scanner and self.scanner.isRunning():
             self.scanner.stop()
             self.scanner.wait(3000)
+        self.converter.shutdown()           # 关闭后台 Word
         self.thumbnailer.shutdown()
         super().closeEvent(event)
 

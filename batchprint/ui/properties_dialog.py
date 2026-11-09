@@ -44,6 +44,7 @@ class PropertiesDialog(QDialog):
 
         self._page_cache: dict[int, QPixmap] = {}
         self._page_index = 0
+        self._src_path, self._src_kind = self._preview_source()
         self._page_count = self._detect_page_count()
 
         self.setWindowTitle(f"属性 - {job.path.name}")
@@ -53,13 +54,21 @@ class PropertiesDialog(QDialog):
         self._show_page(0)
 
     # ---------------- 页数 / 渲染 ----------------
+    def _preview_source(self):
+        """预览用的文件：Word 文档用转换好的 PDF；还没转好时为 None。"""
+        if self.job.kind == "word":
+            return (self.job.pdf_path, "pdf") if self.job.pdf_path else (None, "word")
+        return self.job.path, self.job.kind
+
     def _detect_page_count(self) -> int:
-        if self.job.kind != "pdf":
+        if self._src_kind == "image":
             return 1
+        if self._src_path is None:
+            return 0                     # Word 文档还没转换好
         if self.job.pages:
             return self.job.pages
         try:
-            with fitz.open(self.job.path) as doc:
+            with fitz.open(self._src_path) as doc:
                 return doc.page_count
         except Exception as exc:  # noqa: BLE001
             log.warning("读取页数失败 %s: %s", self.job.path, exc)
@@ -70,8 +79,8 @@ class PropertiesDialog(QDialog):
         if idx in self._page_cache:
             return self._page_cache[idx]
         try:
-            if self.job.kind == "pdf":
-                with fitz.open(self.job.path) as doc:
+            if self._src_kind == "pdf":
+                with fitz.open(self._src_path) as doc:
                     if not (0 <= idx < doc.page_count):
                         return None
                     page = doc.load_page(idx)
@@ -82,7 +91,7 @@ class PropertiesDialog(QDialog):
                                  pix.stride, QImage.Format_RGB888).copy()
                     pm = QPixmap.fromImage(img)
             else:
-                reader = QImageReader(str(self.job.path))
+                reader = QImageReader(str(self._src_path))
                 size = reader.size()
                 if size.isValid() and (size.width() > PREVIEW_PX
                                        or size.height() > PREVIEW_PX):
@@ -168,9 +177,9 @@ class PropertiesDialog(QDialog):
 
         self.edit_range = QLineEdit()
         self.edit_range.setPlaceholderText("留空=全部，例如 1-3,5")
-        if self.job.kind != "pdf":
+        if self.job.kind == "image":
             self.edit_range.setEnabled(False)
-            self.edit_range.setPlaceholderText("（仅 PDF 可用）")
+            self.edit_range.setPlaceholderText("（仅 PDF / Word 文档可用）")
         self.edit_range.textChanged.connect(self._refresh_range_hint)
         form.addRow("页面范围", self.edit_range)
 
@@ -200,8 +209,8 @@ class PropertiesDialog(QDialog):
 
     def _info_text(self) -> str:
         parts = [f"文件：{self.job.path.name}", f"类型：{type_label(self.job)}"]
-        if self.job.kind == "pdf":
-            parts.append(f"页数：{self._page_count}")
+        if self.job.kind != "image":
+            parts.append(f"页数：{self._page_count or '转换完成后显示'}")
         return "\n".join(parts)
 
     # ---------------- 翻页 ----------------
@@ -210,7 +219,13 @@ class PropertiesDialog(QDialog):
 
     def _show_page(self, idx: int) -> None:
         if self._page_count <= 0:
-            self.preview_label.setText("（无法预览）")
+            if self.job.kind == "word" and self.job.convert_error:
+                self.preview_label.setText(f"（无法预览）\n\n{self.job.convert_error}")
+            elif self.job.kind == "word":
+                self.preview_label.setText("Word 文档正在后台转换，\n转换完成后重新打开即可预览。")
+            else:
+                self.preview_label.setText("（无法预览）")
+            self.preview_label.setWordWrap(True)
             return
         idx = max(0, min(idx, self._page_count - 1))
         self._page_index = idx
@@ -230,7 +245,7 @@ class PropertiesDialog(QDialog):
 
     def _refresh_range_hint(self) -> None:
         """提示当前这页在不在「页面范围」里，即会不会被打印。"""
-        if self.job.kind != "pdf" or self._page_count <= 0:
+        if self.job.kind == "image" or self._page_count <= 0:
             self.lbl_in_range.setText("")
             return
         spec = self.edit_range.text().strip()
@@ -283,5 +298,6 @@ class PropertiesDialog(QDialog):
             devmode=self._devmode,
             copies=self.spin_copies.value() if self.chk_copies.isChecked() else None,
             page_range=self.edit_range.text().strip() or None,
+            print_markup=self.job.doc.print_markup,   # 界面暂未开放，原样保留
         )
         super().accept()

@@ -1,4 +1,4 @@
-"""文件导入 / 扫描：识别 PDF 与图片，递归扫描文件夹，去重。"""
+"""文件导入 / 扫描：识别 PDF、图片与 Word 文档，递归扫描文件夹，去重。"""
 from __future__ import annotations
 
 import logging
@@ -13,15 +13,22 @@ log = logging.getLogger(__name__)
 
 PDF_EXTS = {".pdf"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".gif"}
-SUPPORTED_EXTS = PDF_EXTS | IMAGE_EXTS
+WORD_EXTS = {".docx", ".doc"}
+SUPPORTED_EXTS = PDF_EXTS | IMAGE_EXTS | WORD_EXTS
 
 
 def is_supported(path: Path) -> bool:
-    return path.suffix.lower() in SUPPORTED_EXTS
+    # "~$" 开头的是 Word 打开文档时生成的临时锁文件，不是真正的文档
+    return path.suffix.lower() in SUPPORTED_EXTS and not path.name.startswith("~$")
 
 
 def kind_of(path: Path) -> str:
-    return "pdf" if path.suffix.lower() in PDF_EXTS else "image"
+    ext = path.suffix.lower()
+    if ext in PDF_EXTS:
+        return "pdf"
+    if ext in WORD_EXTS:
+        return "word"
+    return "image"
 
 
 def _pdf_page_count(path: Path) -> int | None:
@@ -53,7 +60,10 @@ def expand_paths(paths: Iterable[str | Path]) -> list[Path]:
 
 
 def build_job(path: Path) -> PrintJob:
-    """由单个文件构建打印任务（PDF 会读取页数，属于 I/O，建议放后台线程调用）。"""
+    """由单个文件构建打印任务（PDF 会读取页数，属于 I/O，建议放后台线程调用）。
+
+    Word 文档的页数要等转换成 PDF 之后才知道，这里先留空。
+    """
     kind = kind_of(path)
     pages = _pdf_page_count(path) if kind == "pdf" else None
     return PrintJob(path=path, kind=kind, pages=pages)

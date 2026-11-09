@@ -26,7 +26,12 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[("assets/icon.ico", "assets")],
-    hiddenimports=["win32ui", "win32gui", "win32print", "win32con", "win32api"],
+    hiddenimports=[
+        "win32ui", "win32gui", "win32print", "win32con", "win32api",
+        # Word 文档转换（COM 自动化）
+        "win32com", "win32com.client", "pythoncom", "pywintypes",
+        "win32file", "win32process",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
